@@ -1,11 +1,31 @@
+# Nura — chat frontend
 
-  # Minimalist Logo Design
+Vite + React 18 + Tailwind 4. Connects to the [`nura-emotional-core`](../nura-emotional-core)
+backend over WebSocket (with REST fallback).
 
-  This is a code bundle for Minimalist Logo Design. The original project is available at https://www.figma.com/design/cLwDItumAZoo1JAg9POo9H/Minimalist-Logo-Design.
+## Develop
 
-  ## Running the code
+```
+npm install
+npm run dev          # http://localhost:3000
+```
 
-  Run `npm i` to install the dependencies.
+## Build / preview
 
-  Run `npm run dev` to start the development server.
-  
+```
+npm run build        # outputs to ./build
+npm run preview
+```
+
+## Configuration
+
+| Env var          | Default                                                     | Notes                                          |
+| ---------------- | ----------------------------------------------------------- | ---------------------------------------------- |
+| `VITE_API_URL`   | `https://nura-emotional-core-production.up.railway.app`     | Backend base URL. WS URL is derived from this. |
+
+Set in `.env.local` for development, or in your Vercel project settings for prod.
+
+## Deploy (Vercel)
+
+`vercel.json` pins this as a Vite static build: framework `vite`, output `build/`.
+There is no server in this repo — the chat backend is a separate service.

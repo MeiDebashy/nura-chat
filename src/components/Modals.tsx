@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { X, Download, Trash2, Copy, Check } from "lucide-react";
 
@@ -12,13 +12,21 @@ type ModalProps = {
 };
 
 export function Modal({ open, onClose, title, children }: ModalProps) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const titleId = React.useId();
+
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    // Move focus into the dialog so Tab is bounded by the modal in practice.
+    const t = setTimeout(() => dialogRef.current?.focus(), 0);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      clearTimeout(t);
+    };
   }, [open, onClose]);
 
   return (
@@ -40,9 +48,19 @@ export function Modal({ open, onClose, title, children }: ModalProps) {
             transition={{ duration: 0.2, ease: "easeOut" }}
             className="fixed inset-0 z-[101] flex items-center justify-center p-4 pointer-events-none"
           >
-            <div className="w-full max-w-[460px] max-h-[85vh] bg-[#12121f] border border-white/10 rounded-2xl shadow-[0_20px_60px_rgba(0,0,0,0.6)] flex flex-col overflow-hidden pointer-events-auto">
+            <div
+              ref={dialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby={titleId}
+              tabIndex={-1}
+              className="w-full max-w-[460px] max-h-[85vh] bg-[#12121f] border border-white/10 rounded-2xl shadow-[0_20px_60px_rgba(0,0,0,0.6)] flex flex-col overflow-hidden pointer-events-auto outline-none"
+            >
               <div className="flex items-center justify-between px-5 py-4 border-b border-white/5 shrink-0">
-                <h2 className="text-white text-[15px] font-medium tracking-wide">
+                <h2
+                  id={titleId}
+                  className="text-white text-[15px] font-medium tracking-wide"
+                >
                   {title}
                 </h2>
                 <button

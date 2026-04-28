@@ -1,4 +1,10 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import React, {
+  useState,
+  useRef,
+  useEffect,
+  useCallback,
+  useMemo,
+} from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Send,
@@ -11,47 +17,42 @@ import {
   PanelLeftOpen,
   Settings as SettingsIcon,
   User,
+  AlertTriangle,
 } from "lucide-react";
 import { NuraLogo } from "./components/NuraLogo";
+import { SettingsModal, AccountModal, type Tone } from "./components/Modals";
+import type { Conversation, Message, ServerMsg } from "./lib/types";
 import {
-  SettingsModal,
-  AccountModal,
-  type Tone,
-} from "./components/Modals";
+  STORAGE_KEY,
+  NAME_KEY,
+  TONE_KEY,
+  MEMBER_KEY,
+  USER_ID_KEY,
+  loadConversations,
+  saveConversations,
+} from "./lib/storage";
+import { uuid } from "./lib/uuid";
 
-const API_URL =
+const API_URL = (
   import.meta.env.VITE_API_URL ||
-  "https://nura-emotional-core-production.up.railway.app";
+  "https://nura-emotional-core-production.up.railway.app"
+).replace(/\/+$/, "");
 const WS_URL = API_URL.replace(/^http/, "ws") + "/ws";
-const STORAGE_KEY = "nura-conversations-v1";
-const NAME_KEY = "nura-display-name";
-const TONE_KEY = "nura-tone";
-const MEMBER_KEY = "nura-member-since";
-const USER_ID_KEY = "nura-user-id";
+
 const MAX_TITLE_LEN = 42;
 const MAX_INPUT_HEIGHT = 180;
-
-type Message = {
-  id: string;
-  text: string;
-  sender: "user" | "nura";
-  timestamp: number;
-};
-
-type Conversation = {
-  id: string;
-  title: string;
-  messages: Message[];
-  createdAt: number;
-  updatedAt: number;
-};
+const MAX_MESSAGE_LEN = 4000;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
 
 const SUGGESTIONS = ["How are you?", "I need to talk", "I'm feeling anxious"];
+
+// ── Local persistence helpers ────────────────────────────────────────────
 
 function getUserId(): string {
   let id = localStorage.getItem(USER_ID_KEY);
   if (!id) {
-    id = crypto.randomUUID();
+    id = uuid();
     localStorage.setItem(USER_ID_KEY, id);
   }
   return id;
@@ -76,26 +77,6 @@ function loadTone(): Tone {
   const v = localStorage.getItem(TONE_KEY);
   if (v === "gentle" || v === "direct" || v === "playful") return v;
   return "gentle";
-}
-
-function loadConversations(): Conversation[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed;
-  } catch {
-    return [];
-  }
-}
-
-function saveConversations(convs: Conversation[]) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(convs));
-  } catch {
-    // quota exceeded or serialization error — ignore
-  }
 }
 
 function titleFromText(text: string): string {
@@ -139,15 +120,21 @@ export default function App() {
   );
   const [activeId, setActiveId] = useState<string | null>(null);
   const [inputValue, setInputValue] = useState("");
-  const [isTyping, setIsTyping] = useState(false);
+  // typingForId: the conversation id that has a reply in flight (or null).
+  // Keeping it scoped per-conversation prevents dots from following the user
+  // when they switch chats mid-reply.
+  const [typingForId, setTypingForId] = useState<string | null>(null);
+  const [sendError, setSendError] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isDesktopSidebarOpen, setIsDesktopSidebarOpen] = useState(true);
   const [isConnected, setIsConnected] = useState(false);
-  const [displayName, setDisplayName] = useState<string>(() => loadDisplayName());
-  const [tone, setTone] = useState<Tone>(() => loadTone());
-  const [activeModal, setActiveModal] = useState<"settings" | "account" | null>(
-    null
+  const [displayName, setDisplayName] = useState<string>(() =>
+    loadDisplayName()
   );
+  const [tone, setTone] = useState<Tone>(() => loadTone());
+  const [activeModal, setActiveModal] = useState<
+    "settings" | "account" | null
+  >(null);
   const [memberSince] = useState<number>(() => getMemberSince());
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -157,9 +144,13 @@ export default function App() {
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined
   );
+  const reconnectAttempts = useRef(0);
+  const isUnmountingRef = useRef(false);
   const replyTargetIdRef = useRef<string | null>(null);
   const displayNameRef = useRef(displayName);
   const toneRef = useRef(tone);
+  const prevActiveIdRef = useRef<string | null>(null);
+
   useEffect(() => {
     displayNameRef.current = displayName;
   }, [displayName]);
@@ -183,9 +174,12 @@ export default function App() {
     saveConversations(conversations);
   }, [conversations]);
 
-  // Persist display name and tone
+  // Persist display name (debounced) and tone
   useEffect(() => {
-    localStorage.setItem(NAME_KEY, displayName);
+    const t = setTimeout(() => {
+      localStorage.setItem(NAME_KEY, displayName);
+    }, 250);
+    return () => clearTimeout(t);
   }, [displayName]);
   useEffect(() => {
     localStorage.setItem(TONE_KEY, tone);
@@ -196,10 +190,15 @@ export default function App() {
     [conversations]
   );
 
-  // Scroll to bottom on new messages
+  // Scroll to bottom on new messages — smooth when the same conversation
+  // grows, instant when switching conversations.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length, isTyping, activeId]);
+    const switched = prevActiveIdRef.current !== activeId;
+    prevActiveIdRef.current = activeId;
+    messagesEndRef.current?.scrollIntoView({
+      behavior: switched ? "auto" : "smooth",
+    });
+  }, [messages.length, typingForId, activeId]);
 
   // Auto-grow textarea
   useEffect(() => {
@@ -211,17 +210,33 @@ export default function App() {
 
   // WebSocket connection
   const connectWs = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    if (isUnmountingRef.current) return;
+    const existing = wsRef.current;
+    if (
+      existing &&
+      (existing.readyState === WebSocket.OPEN ||
+        existing.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
 
-    const ws = new WebSocket(WS_URL);
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(WS_URL);
+    } catch (err) {
+      console.error("[nura] WebSocket construction failed:", err);
+      scheduleReconnect();
+      return;
+    }
     wsRef.current = ws;
 
     ws.onopen = () => {
+      reconnectAttempts.current = 0;
       setIsConnected(true);
     };
 
     ws.onmessage = (event) => {
-      let data: { type: string; text?: string; index?: number; message?: string };
+      let data: ServerMsg;
       try {
         data = JSON.parse(event.data);
       } catch {
@@ -229,13 +244,15 @@ export default function App() {
       }
 
       if (data.type === "typing") {
-        setIsTyping(true);
-      } else if (data.type === "segment" && data.text) {
-        setIsTyping(false);
+        // server announces typing; mark the conversation that has a reply in flight
+        if (replyTargetIdRef.current) {
+          setTypingForId(replyTargetIdRef.current);
+        }
+      } else if (data.type === "segment" && typeof data.text === "string") {
         const targetId = replyTargetIdRef.current;
         if (!targetId) return;
         const newMsg: Message = {
-          id: `nura-${Date.now()}-${data.index ?? 0}`,
+          id: uuid(),
           text: data.text,
           sender: "nura",
           timestamp: Date.now(),
@@ -252,109 +269,170 @@ export default function App() {
           )
         );
       } else if (data.type === "done") {
-        setIsTyping(false);
+        setTypingForId(null);
+        replyTargetIdRef.current = null;
       } else if (data.type === "error") {
-        setIsTyping(false);
+        setTypingForId(null);
+        replyTargetIdRef.current = null;
+        setSendError(data.message ?? "Server error");
         console.error("[nura] Server error:", data.message);
       }
     };
 
     ws.onclose = () => {
       setIsConnected(false);
-      reconnectTimer.current = setTimeout(connectWs, 3000);
+      scheduleReconnect();
     };
 
     ws.onerror = () => {
-      ws.close();
+      // Don't call ws.close() here — onclose fires regardless. Calling close()
+      // can re-trigger error and stack reconnects.
     };
   }, []);
 
+  const scheduleReconnect = useCallback(() => {
+    if (isUnmountingRef.current) return;
+    clearTimeout(reconnectTimer.current);
+    const attempt = ++reconnectAttempts.current;
+    const delay = Math.min(
+      RECONNECT_MAX_MS,
+      RECONNECT_BASE_MS * 2 ** Math.min(attempt - 1, 6)
+    );
+    const jitter = Math.random() * 250;
+    reconnectTimer.current = setTimeout(connectWs, delay + jitter);
+  }, [connectWs]);
+
   useEffect(() => {
+    isUnmountingRef.current = false;
     connectWs();
     return () => {
+      isUnmountingRef.current = true;
       clearTimeout(reconnectTimer.current);
-      wsRef.current?.close();
+      const ws = wsRef.current;
+      if (ws) {
+        // Detach handlers so a stale onclose doesn't schedule a reconnect.
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        ws.close();
+      }
     };
   }, [connectWs]);
 
-  const sendToServer = (messageText: string) => {
-    const payload = {
-      type: "chat" as const,
-      userId: userIdRef.current,
-      message: messageText,
-      displayName: displayNameRef.current || undefined,
-      tone: toneRef.current,
-      timestamp: new Date().toISOString(),
-    };
+  const sendToServer = useCallback(
+    (messageText: string, targetId: string) => {
+      const payload = {
+        type: "chat" as const,
+        userId: userIdRef.current,
+        message: messageText,
+        displayName: displayNameRef.current || undefined,
+        tone: toneRef.current,
+        timestamp: new Date().toISOString(),
+      };
 
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(payload));
-      return;
-    }
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        try {
+          wsRef.current.send(JSON.stringify(payload));
+          return;
+        } catch (err) {
+          console.error("[nura] WS send failed, falling back to REST:", err);
+        }
+      }
 
-    // REST fallback
-    fetch(`${API_URL}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: payload.message,
-        userId: payload.userId,
-        displayName: payload.displayName,
-        tone: payload.tone,
-        timestamp: payload.timestamp,
-      }),
-    })
-      .then((res) => res.json())
-      .then((data) => {
-        setIsTyping(false);
-        if (!data?.segments) return;
-        const targetId = replyTargetIdRef.current;
-        if (!targetId) return;
-        const now = Date.now();
-        const nuraMessages: Message[] = data.segments.map(
-          (seg: string | { text: string }, i: number) => ({
-            id: `nura-${now}-${i}`,
-            text: typeof seg === "string" ? seg : seg.text,
-            sender: "nura" as const,
-            timestamp: now,
-          })
-        );
-        setConversations((prev) =>
-          prev.map((c) =>
-            c.id === targetId
-              ? {
-                  ...c,
-                  messages: [...c.messages, ...nuraMessages],
-                  updatedAt: now,
-                }
-              : c
-          )
-        );
+      // REST fallback
+      fetch(`${API_URL}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: payload.message,
+          userId: payload.userId,
+          displayName: payload.displayName,
+          tone: payload.tone,
+          timestamp: payload.timestamp,
+        }),
       })
-      .catch((err) => {
-        setIsTyping(false);
-        console.error("[nura] REST fallback error:", err);
-      });
-  };
+        .then(async (res) => {
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+          }
+          return res.json();
+        })
+        .then((data) => {
+          // Only commit if this is still the current pending reply.
+          if (replyTargetIdRef.current !== targetId) return;
+          setTypingForId(null);
+          replyTargetIdRef.current = null;
+          if (!data?.segments || !Array.isArray(data.segments)) return;
+          const now = Date.now();
+          const nuraMessages: Message[] = data.segments.map(
+            (seg: string | { text: string }) => ({
+              id: uuid(),
+              text: typeof seg === "string" ? seg : seg.text,
+              sender: "nura" as const,
+              timestamp: now,
+            })
+          );
+          setConversations((prev) =>
+            prev.map((c) =>
+              c.id === targetId
+                ? {
+                    ...c,
+                    messages: [...c.messages, ...nuraMessages],
+                    updatedAt: now,
+                  }
+                : c
+            )
+          );
+        })
+        .catch((err) => {
+          if (replyTargetIdRef.current === targetId) {
+            setTypingForId(null);
+            replyTargetIdRef.current = null;
+          }
+          setSendError(
+            "Couldn't reach Nura. Check your connection and try again."
+          );
+          console.error("[nura] REST fallback error:", err);
+        });
+    },
+    []
+  );
 
   const handleSend = (text?: string) => {
-    const messageText = (text ?? inputValue).trim();
-    if (!messageText || isTyping) return;
+    const raw = (text ?? inputValue).trim();
+    if (!raw) return;
+    if (typingForId !== null) return; // wait for current reply
+
+    // Hard cap to avoid runaway payloads.
+    const messageText = raw.slice(0, MAX_MESSAGE_LEN);
+    setSendError(null);
 
     const now = Date.now();
     const userMsg: Message = {
-      id: `user-${now}`,
+      id: uuid(),
       text: messageText,
       sender: "user",
       timestamp: now,
     };
 
     let targetId = activeId;
-
-    setConversations((prev) => {
-      if (targetId && prev.some((c) => c.id === targetId)) {
-        return prev.map((c) =>
-          c.id === targetId
+    if (!targetId) {
+      targetId = uuid();
+      const newConv: Conversation = {
+        id: targetId,
+        title: titleFromText(messageText),
+        messages: [userMsg],
+        createdAt: now,
+        updatedAt: now,
+      };
+      setConversations((prev) => [newConv, ...prev]);
+      setActiveId(targetId);
+    } else {
+      const tid = targetId;
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === tid
             ? {
                 ...c,
                 title:
@@ -363,41 +441,31 @@ export default function App() {
                 updatedAt: now,
               }
             : c
-        );
-      }
-      // create new conversation
-      const newConv: Conversation = {
-        id: crypto.randomUUID(),
-        title: titleFromText(messageText),
-        messages: [userMsg],
-        createdAt: now,
-        updatedAt: now,
-      };
-      targetId = newConv.id;
-      return [newConv, ...prev];
-    });
+        )
+      );
+    }
 
-    if (targetId && targetId !== activeId) setActiveId(targetId);
     replyTargetIdRef.current = targetId;
-
+    setTypingForId(targetId);
     setInputValue("");
-    setIsTyping(true);
-    sendToServer(messageText);
+    sendToServer(messageText, targetId);
   };
 
   const handleNewChat = () => {
+    // Don't drop a pending reply: if one is in flight, just navigate away
+    // without resetting typing state — the reply still belongs to the
+    // conversation it was sent from.
     setActiveId(null);
     setInputValue("");
-    setIsTyping(false);
-    replyTargetIdRef.current = null;
     setIsSidebarOpen(false);
-    // focus input shortly after so user can type immediately
+    setSendError(null);
     setTimeout(() => textareaRef.current?.focus(), 50);
   };
 
   const handleSelectConversation = (id: string) => {
     setActiveId(id);
     setIsSidebarOpen(false);
+    setSendError(null);
   };
 
   const handleDeleteConversation = (id: string) => {
@@ -407,9 +475,10 @@ export default function App() {
     );
     if (!ok) return;
     setConversations((prev) => prev.filter((c) => c.id !== id));
-    if (activeId === id) {
-      setActiveId(null);
+    if (activeId === id) setActiveId(null);
+    if (replyTargetIdRef.current === id) {
       replyTargetIdRef.current = null;
+      setTypingForId(null);
     }
   };
 
@@ -424,13 +493,14 @@ export default function App() {
     setConversations([]);
     setActiveId(null);
     replyTargetIdRef.current = null;
+    setTypingForId(null);
   };
 
   const handleExport = () => {
     if (conversations.length === 0) return;
     const data = {
       exportedAt: new Date().toISOString(),
-      userId: userIdRef.current,
+      // userId intentionally omitted — exports shouldn't leak identity.
       displayName,
       tone,
       conversations,
@@ -453,11 +523,9 @@ export default function App() {
       "Reset everything? This deletes all conversations, your name, and your user ID. This can't be undone."
     );
     if (!ok) return;
-    localStorage.removeItem(STORAGE_KEY);
-    localStorage.removeItem(NAME_KEY);
-    localStorage.removeItem(TONE_KEY);
-    localStorage.removeItem(MEMBER_KEY);
-    localStorage.removeItem(USER_ID_KEY);
+    [STORAGE_KEY, NAME_KEY, TONE_KEY, MEMBER_KEY, USER_ID_KEY].forEach((k) =>
+      localStorage.removeItem(k)
+    );
     window.location.reload();
   };
 
@@ -468,20 +536,10 @@ export default function App() {
     }
   };
 
+  const isReplyForActive = typingForId !== null && typingForId === activeId;
+
   return (
     <div className="flex h-[100dvh] w-full bg-[#0a0a0f] text-gray-100 font-sans overflow-hidden selection:bg-cyan-500/30">
-      <style
-        dangerouslySetInnerHTML={{
-          __html: `
-        .custom-scrollbar::-webkit-scrollbar { width: 5px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.08); border-radius: 10px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.15); }
-        textarea.nura-input { resize: none; }
-      `,
-        }}
-      />
-
       {/* Mobile Sidebar Overlay */}
       {isSidebarOpen && (
         <div
@@ -588,6 +646,9 @@ export default function App() {
                         </div>
                         <div className="text-[11px] text-gray-500">
                           {formatRelativeTime(conv.updatedAt)}
+                          {typingForId === conv.id && (
+                            <span className="ml-1 text-cyan-400">· typing</span>
+                          )}
                         </div>
                       </div>
                     </button>
@@ -785,7 +846,7 @@ export default function App() {
                 </AnimatePresence>
 
                 {/* Typing Indicator */}
-                {isTyping && (
+                {isReplyForActive && (
                   <motion.div
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
@@ -822,19 +883,38 @@ export default function App() {
         {/* Input Area */}
         <div className="w-full shrink-0 p-4 md:px-6 md:pb-6 md:pt-2 bg-gradient-to-t from-[#0a0a0f] via-[#0a0a0f] to-transparent z-20">
           <div className="max-w-[680px] mx-auto">
+            {sendError && (
+              <div
+                role="alert"
+                className="mb-3 flex items-start gap-2 px-3 py-2 rounded-lg border border-red-500/30 bg-red-500/10 text-[13px] text-red-200"
+              >
+                <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                <span className="flex-1">{sendError}</span>
+                <button
+                  onClick={() => setSendError(null)}
+                  className="text-red-300/70 hover:text-red-100"
+                  aria-label="Dismiss error"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            )}
             <div className="relative flex items-end bg-[#151523] rounded-[24px] md:rounded-[28px] border border-white/5 focus-within:border-cyan-500/30 focus-within:bg-[#1a1a2e] transition-all duration-300 shadow-[0_0_20px_rgba(0,0,0,0.5)]">
               <textarea
                 ref={textareaRef}
                 value={inputValue}
-                onChange={(e) => setInputValue(e.target.value)}
+                onChange={(e) =>
+                  setInputValue(e.target.value.slice(0, MAX_MESSAGE_LEN))
+                }
                 onKeyDown={handleKeyDown}
                 placeholder="Message Nura…"
                 rows={1}
+                maxLength={MAX_MESSAGE_LEN}
                 className="nura-input flex-1 bg-transparent pl-5 md:pl-6 pr-2 py-3.5 md:py-4 text-[15px] text-white placeholder-gray-500 outline-none w-full leading-relaxed max-h-[180px]"
               />
               <button
                 onClick={() => handleSend()}
-                disabled={!inputValue.trim() || isTyping}
+                disabled={!inputValue.trim() || typingForId !== null}
                 className="p-2.5 md:p-3 mr-1.5 md:mr-2 mb-1.5 md:mb-1.5 rounded-full bg-cyan-500 hover:bg-cyan-400 disabled:opacity-30 disabled:hover:bg-cyan-500 text-[#0a0a0f] transition-all flex items-center justify-center shrink-0 shadow-[0_0_15px_rgba(0,212,255,0.4)] disabled:shadow-none"
                 aria-label="Send message"
               >
