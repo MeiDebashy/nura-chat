@@ -295,7 +295,20 @@ export default function App() {
             )
           );
         }
-        setSendError(message);
+        // Translate the backend's machine codes into user-readable text.
+        const human =
+          message === "rate_limited"
+            ? "You're sending too fast. Wait a moment and try again."
+            : message === "invalid_message"
+            ? "That message couldn't be sent. Try again."
+            : message === "invalid_userId"
+            ? "Session error. Please refresh the page."
+            : message === "internal_error"
+            ? "Nura had a hiccup. Try again."
+            : message === "invalid_json"
+            ? "Connection got out of sync. Reloading should fix it."
+            : message;
+        setSendError(human);
       },
     }),
     [decodeConversationId]
@@ -449,16 +462,28 @@ export default function App() {
         confirmLabel: "Delete",
         destructive: true,
         onConfirm: () => {
+          // Optimistic frontend removal first; the server delete is
+          // best-effort. If it fails (offline, rate-limited) the server's
+          // 30-min idle eviction will eventually clean up.
           setConversations((prev) => prev.filter((c) => c.id !== id));
           if (activeId === id) setActiveId(null);
           if (replyTargetIdRef.current === id) {
             replyTargetIdRef.current = null;
             setTypingForId(null);
           }
+          // Wipe the corresponding backend session so emotional state
+          // doesn't linger after the user explicitly deleted the chat.
+          fetch(`${API_URL}/api/session`, {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ userId: composeWireUserId(id) }),
+          }).catch((err) => {
+            console.warn("[nura] /api/session DELETE failed:", err);
+          });
         },
       });
     },
-    [activeId, conversations]
+    [activeId, composeWireUserId, conversations]
   );
 
   const handleClearAll = useCallback(() => {
