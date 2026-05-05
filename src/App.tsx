@@ -16,6 +16,8 @@ import {
 } from "./lib/storage";
 import { uuid } from "./lib/uuid";
 import { useChatSocket, type BackendState } from "./lib/useChatSocket";
+import { useOnline } from "./lib/useOnline";
+import { ConsentGate, hasConsented } from "./components/ConsentGate";
 
 const API_URL = (
   import.meta.env.VITE_API_URL ||
@@ -74,8 +76,12 @@ function useMediaQuery(query: string): boolean {
   return matches;
 }
 
+const STUCK_MESSAGE_TIMEOUT_MS = 30_000;
+
 export default function App() {
   const isDesktop = useMediaQuery("(min-width: 768px)");
+  const isOnline = useOnline();
+  const [consented, setConsented] = useState(() => hasConsented());
 
   const [conversations, setConversations] = useState<Conversation[]>(() =>
     loadConversations()
@@ -462,6 +468,75 @@ export default function App() {
     }
   }, [isDesktop, activeId, isDrawerOpen]);
 
+  // ── Watchdog: any user message stuck in "sending" for too long is failed ──
+  // Catches the case where WS drops mid-flight and the server never acks.
+  useEffect(() => {
+    const t = setInterval(() => {
+      const now = Date.now();
+      let dirty = false;
+      const next = conversations.map((c) => {
+        const messages = c.messages.map((m) => {
+          if (
+            m.sender === "user" &&
+            m.status === "sending" &&
+            now - m.timestamp > STUCK_MESSAGE_TIMEOUT_MS
+          ) {
+            dirty = true;
+            return { ...m, status: "failed" as const };
+          }
+          return m;
+        });
+        return dirty ? { ...c, messages } : c;
+      });
+      if (dirty) {
+        setConversations(next);
+        if (replyTargetIdRef.current) {
+          replyTargetIdRef.current = null;
+          setTypingForId(null);
+        }
+      }
+    }, 5000);
+    return () => clearInterval(t);
+  }, [conversations]);
+
+  // ── Retry a failed user message ────────────────────────────────────────
+  const handleRetry = useCallback(
+    (message: Message) => {
+      if (typingForId !== null) return;
+      // Find which conversation the message lives in.
+      const conv = conversations.find((c) =>
+        c.messages.some((m) => m.id === message.id)
+      );
+      if (!conv) return;
+
+      setSendError(null);
+      const now = Date.now();
+      // Mark the original as "sending" again rather than spawning a duplicate.
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === conv.id
+            ? {
+                ...c,
+                updatedAt: now,
+                messages: c.messages.map((m) =>
+                  m.id === message.id
+                    ? { ...m, status: "sending" as const, timestamp: now }
+                    : m
+                ),
+              }
+            : c
+        )
+      );
+      replyTargetIdRef.current = conv.id;
+      setTypingForId(conv.id);
+      send({
+        userId: composeWireUserId(conv.id),
+        message: message.text,
+      });
+    },
+    [composeWireUserId, conversations, send, typingForId]
+  );
+
   const isReplyForActive = typingForId !== null && typingForId === activeId;
 
   const composer = (
@@ -474,6 +549,10 @@ export default function App() {
       maxLength={MAX_MESSAGE_LEN}
     />
   );
+
+  if (!consented) {
+    return <ConsentGate onAccept={() => setConsented(true)} />;
+  }
 
   return (
     <div className="flex h-[100dvh] w-full bg-[#0a0a0f] text-gray-100 overflow-hidden selection:bg-cyan-500/30">
@@ -548,6 +627,7 @@ export default function App() {
         conversation={active}
         isTyping={isReplyForActive}
         isConnected={isConnected}
+        isOnline={isOnline}
         showSidebarToggle={isDesktop ? !isDesktopSidebarOpen : true}
         onOpenSidebar={() => {
           if (isDesktop) setIsDesktopSidebarOpen(true);
@@ -556,6 +636,7 @@ export default function App() {
         sendError={sendError}
         onDismissError={() => setSendError(null)}
         onSuggestionClick={(s) => handleSend(s)}
+        onRetry={handleRetry}
         composerSlot={composer}
       />
 

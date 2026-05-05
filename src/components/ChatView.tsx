@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Menu, ChevronDown, AlertTriangle, X } from "lucide-react";
+import { ArrowLeft, Menu, ChevronDown, AlertTriangle, X, WifiOff } from "lucide-react";
 import type { Conversation, Message } from "../lib/types";
 import {
   MessageBubble,
@@ -15,11 +15,13 @@ interface Props {
   conversation: Conversation | null;
   isTyping: boolean;
   isConnected: boolean;
+  isOnline: boolean;
   onOpenSidebar(): void; // mobile back / desktop reopen
   showSidebarToggle: boolean;
   sendError: string | null;
   onDismissError(): void;
   onSuggestionClick(text: string): void;
+  onRetry?(message: Message): void;
   composerSlot: React.ReactNode;
 }
 
@@ -29,11 +31,13 @@ export function ChatView({
   conversation,
   isTyping,
   isConnected,
+  isOnline,
   onOpenSidebar,
   showSidebarToggle,
   sendError,
   onDismissError,
   onSuggestionClick,
+  onRetry,
   composerSlot,
 }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -109,7 +113,9 @@ export function ChatView({
 
   const headerTitle = conversation?.title ?? "Nura";
   const phaseText = phaseLabel(conversation?.phase);
-  const headerSubtitle = isTyping
+  const headerSubtitle = !isOnline
+    ? "offline"
+    : isTyping
     ? "typing…"
     : !isConnected
     ? "connecting…"
@@ -154,7 +160,9 @@ export function ChatView({
           </div>
           <div
             className={`text-[11.5px] leading-tight truncate ${
-              isTyping
+              !isOnline
+                ? "text-red-400/90"
+                : isTyping
                 ? "text-cyan-400"
                 : isConnected
                 ? "text-emerald-400/90"
@@ -165,6 +173,17 @@ export function ChatView({
           </div>
         </div>
       </header>
+
+      {/* Offline banner */}
+      {!isOnline && (
+        <div
+          role="status"
+          className="flex items-center justify-center gap-2 px-3 py-1.5 text-[12px] text-amber-100 bg-amber-500/10 border-b border-amber-500/20"
+        >
+          <WifiOff size={13} />
+          <span>You're offline. Messages will fail until you reconnect.</span>
+        </div>
+      )}
 
       {/* Crisis banner */}
       {conversation?.crisis && <CrisisBanner />}
@@ -235,6 +254,7 @@ export function ChatView({
                     key={it.key}
                     message={it.message}
                     showTail={it.showTail}
+                    onRetry={onRetry}
                   />
                 )
               )}

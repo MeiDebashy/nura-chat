@@ -1,26 +1,41 @@
-import { Check, CheckCheck, AlertCircle } from "lucide-react";
+import { Check, CheckCheck, AlertCircle, RotateCw } from "lucide-react";
 import type { Message } from "../lib/types";
 import { formatClock } from "../lib/time";
 
 interface Props {
   message: Message;
   showTail: boolean;
+  onRetry?: (message: Message) => void;
 }
 
-export function MessageBubble({ message, showTail }: Props) {
+export function MessageBubble({ message, showTail, onRetry }: Props) {
   const isUser = message.sender === "user";
   const status = message.status;
+  const failed = isUser && status === "failed";
 
   return (
     <div
-      className={`group flex w-full ${
+      className={`group flex w-full items-end gap-2 ${
         isUser ? "justify-end" : "justify-start"
       }`}
     >
+      {failed && onRetry && (
+        <button
+          type="button"
+          onClick={() => onRetry(message)}
+          aria-label="Retry sending"
+          title="Retry sending"
+          className="shrink-0 w-7 h-7 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-red-300 flex items-center justify-center focus:outline-none focus-visible:ring-2 focus-visible:ring-red-400/60 transition-colors"
+        >
+          <RotateCw size={13} />
+        </button>
+      )}
       <div
         className={`relative max-w-[85%] md:max-w-[70%] px-3.5 py-2 text-[14.5px] leading-snug shadow-sm ${
           isUser
-            ? "bg-cyan-600/90 text-white"
+            ? failed
+              ? "bg-red-500/15 text-red-50 border border-red-500/30"
+              : "bg-cyan-600/90 text-white"
             : "bg-[#1c1c2a] text-gray-100 border border-white/5"
         }`}
         style={{
