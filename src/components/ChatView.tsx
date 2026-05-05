@@ -9,6 +9,7 @@ import {
 } from "./MessageBubble";
 import { Avatar } from "./Avatar";
 import { dayKey, dayLabel } from "../lib/time";
+import { phaseLabel } from "../lib/phase";
 
 interface Props {
   conversation: Conversation | null;
@@ -107,11 +108,14 @@ export function ChatView({
   }, []);
 
   const headerTitle = conversation?.title ?? "Nura";
+  const phaseText = phaseLabel(conversation?.phase);
   const headerSubtitle = isTyping
     ? "typing…"
-    : isConnected
-    ? "online"
-    : "connecting…";
+    : !isConnected
+    ? "connecting…"
+    : phaseText
+    ? `${phaseText} · online`
+    : "online";
 
   return (
     <section className="flex-1 flex flex-col h-full min-w-0 bg-[#0a0a0f] relative">

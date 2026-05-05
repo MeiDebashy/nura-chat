@@ -19,6 +19,9 @@ export interface Conversation {
   unread?: number;
   lastReadAt?: number;
   crisis?: boolean;
+  // Last `phase.current_phase` reported by the backend's `done` envelope.
+  // 0 = Stranger … 4 = Devoted. See nura-emotional-core PHASE_PERSONALITIES.
+  phase?: number;
 }
 
 // Wire protocol mirrored from nura-emotional-core/src/server/index.ts

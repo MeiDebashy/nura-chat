@@ -15,7 +15,7 @@ import {
   saveConversations,
 } from "./lib/storage";
 import { uuid } from "./lib/uuid";
-import { useChatSocket } from "./lib/useChatSocket";
+import { useChatSocket, type BackendState } from "./lib/useChatSocket";
 
 const API_URL = (
   import.meta.env.VITE_API_URL ||
@@ -137,68 +137,105 @@ export default function App() {
     [conversations]
   );
 
-  // ── Socket events: ref-stable handlers reading current state via refs ──
+  // Track latest activeId for use in stable callbacks
+  const activeIdLatestRef = useRef<string | null>(null);
+  useEffect(() => {
+    activeIdLatestRef.current = activeId;
+  }, [activeId]);
+
+  // ── Wire userId ↔ conversationId ───────────────────────────────────────
+  // The backend keys NuraLLM sessions by `userId`. We send a composite id
+  // `${baseUserId}:${conversationId}` so each chat has its own emotional
+  // history (phase, elasticity, repetition, anchor scheduler).
+  // Server echoes our composite back in every event — we use it to route
+  // segments/done/typing/error to the right conversation in state.
+  const composeWireUserId = useCallback(
+    (conversationId: string) => `${userIdRef.current}:${conversationId}`,
+    []
+  );
+
+  const decodeConversationId = useCallback(
+    (wireUserId: string | null): string | null => {
+      if (!wireUserId) return null;
+      const sep = wireUserId.indexOf(":");
+      if (sep === -1) return null;
+      return wireUserId.slice(sep + 1) || null;
+    },
+    []
+  );
+
+  // ── Socket events: ref-stable, route by wire userId ────────────────────
   const socketEvents = useMemo(
     () => ({
-      onTyping() {
-        if (replyTargetIdRef.current) {
-          setTypingForId(replyTargetIdRef.current);
-        }
+      onTyping(wireUserId: string) {
+        const cid = decodeConversationId(wireUserId);
+        if (cid) setTypingForId(cid);
       },
-      onSegment(text: string) {
-        const targetId = replyTargetIdRef.current;
-        if (!targetId) return;
+      onFragmentReceived(_wireUserId: string, _pending: number) {
+        // Reserved: backend acks fragment buffering. No UI for now —
+        // the `typing`/`segment`/`done` lifecycle is the user-visible signal.
+      },
+      onSegment(wireUserId: string, text: string) {
+        const cid = decodeConversationId(wireUserId);
+        if (!cid) return;
+        const now = Date.now();
         const newMsg: Message = {
           id: uuid(),
           text,
           sender: "nura",
-          timestamp: Date.now(),
+          timestamp: now,
         };
         setConversations((prev) =>
           prev.map((c) =>
-            c.id === targetId
+            c.id === cid
               ? {
                   ...c,
                   messages: [...c.messages, newMsg],
-                  updatedAt: Date.now(),
-                  unread:
-                    c.id === activeIdLatestRef.current ? 0 : (c.unread ?? 0) + 1,
+                  updatedAt: now,
                 }
               : c
           )
         );
       },
-      onDone(crisis: boolean) {
-        const targetId = replyTargetIdRef.current;
-        setTypingForId(null);
-        replyTargetIdRef.current = null;
-        // Mark user messages as sent
-        if (targetId) {
-          setConversations((prev) =>
-            prev.map((c) =>
-              c.id === targetId
-                ? {
-                    ...c,
-                    crisis: c.crisis || crisis,
-                    messages: c.messages.map((m) =>
-                      m.sender === "user" && m.status === "sending"
-                        ? { ...m, status: "sent" as const }
-                        : m
-                    ),
-                  }
-                : c
-            )
-          );
+      onDone(wireUserId: string, crisis: boolean, state?: BackendState) {
+        const cid = decodeConversationId(wireUserId);
+        if (!cid) return;
+        if (replyTargetIdRef.current === cid) {
+          setTypingForId(null);
+          replyTargetIdRef.current = null;
         }
+        const phase = state?.phase?.current_phase;
+        const isViewing = cid === activeIdLatestRef.current;
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === cid
+              ? {
+                  ...c,
+                  crisis: c.crisis || crisis,
+                  phase: typeof phase === "number" ? phase : c.phase,
+                  // Increment unread once per reply (not per segment) when
+                  // user is on a different conversation.
+                  unread: isViewing ? 0 : (c.unread ?? 0) + 1,
+                  messages: c.messages.map((m) =>
+                    m.sender === "user" && m.status === "sending"
+                      ? { ...m, status: "sent" as const }
+                      : m
+                  ),
+                }
+              : c
+          )
+        );
       },
-      onError(message: string) {
-        setTypingForId(null);
-        const targetId = replyTargetIdRef.current;
-        replyTargetIdRef.current = null;
-        if (targetId) {
+      onError(wireUserId: string | null, message: string) {
+        const cid = decodeConversationId(wireUserId);
+        if (cid && replyTargetIdRef.current === cid) {
+          setTypingForId(null);
+          replyTargetIdRef.current = null;
+        }
+        if (cid) {
           setConversations((prev) =>
             prev.map((c) =>
-              c.id === targetId
+              c.id === cid
                 ? {
                     ...c,
                     messages: c.messages.map((m) =>
@@ -214,14 +251,8 @@ export default function App() {
         setSendError(message);
       },
     }),
-    []
+    [decodeConversationId]
   );
-
-  // Track latest activeId for use in stable callbacks above
-  const activeIdLatestRef = useRef<string | null>(null);
-  useEffect(() => {
-    activeIdLatestRef.current = activeId;
-  }, [activeId]);
 
   const { isConnected, send } = useChatSocket(API_URL, socketEvents);
 
@@ -282,13 +313,11 @@ export default function App() {
       setInputValue("");
 
       send({
-        userId: userIdRef.current,
+        userId: composeWireUserId(targetId),
         message: messageText,
-        displayName: displayNameRef.current || undefined,
-        tone: toneRef.current,
       });
     },
-    [activeId, inputValue, send, typingForId]
+    [activeId, composeWireUserId, inputValue, send, typingForId]
   );
 
   // ── Conversation operations ─────────────────────────────────────────────

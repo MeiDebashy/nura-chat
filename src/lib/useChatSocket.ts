@@ -1,35 +1,64 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ServerMsg } from "./types";
 
+/**
+ * Wire contract — mirrors nura-emotional-core/src/server/index.ts
+ *
+ *   Client → Server (WS):
+ *     { type: "chat", userId, message, timestamp }
+ *
+ *   Server → Client (WS):
+ *     { type: "fragment_received", userId, pending }
+ *     { type: "typing", userId }
+ *     { type: "segment", userId, text, index, total }
+ *     { type: "done", userId, state, crisis }
+ *     { type: "error", message }
+ *
+ *   REST  POST /api/chat → { segments: [{ text, delay_ms }], state, crisis }
+ *
+ *   Note: backend ignores `displayName` and `tone` (the user-facing tone
+ *   selector is cosmetic; Nura's tone is derived from the relationship
+ *   phase in PHASE_PERSONALITIES).
+ *
+ *   The frontend sends a composite userId of the form `${baseUserId}:${conversationId}`
+ *   so each conversation gets its own NuraLLM session + state on the server.
+ */
+
+export interface BackendState {
+  phase?: { current_phase?: number };
+}
+
 export interface ChatSocketEvents {
-  onTyping(): void;
-  onSegment(text: string, index: number, total: number): void;
-  onDone(crisis: boolean): void;
-  onError(message: string): void;
+  onTyping(targetUserId: string): void;
+  onFragmentReceived(targetUserId: string, pending: number): void;
+  onSegment(
+    targetUserId: string,
+    text: string,
+    index: number,
+    total: number
+  ): void;
+  onDone(targetUserId: string, crisis: boolean, state?: BackendState): void;
+  onError(targetUserId: string | null, message: string): void;
 }
 
 export interface SendPayload {
-  userId: string;
+  userId: string; // composite: base:conversationId
   message: string;
-  displayName?: string;
-  tone: string;
+  timestamp?: string;
 }
 
 export interface ChatSocketHandle {
   isConnected: boolean;
-  send(payload: SendPayload): "ws" | "rest" | "queued";
+  send(payload: SendPayload): "ws" | "rest";
 }
 
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
+// REST fallback delay clamps — server's segmenter caps base delay to ~1.2s
+// already, but bound here defensively so the UI never feels stuck.
+const REST_MIN_DELAY_MS = 0;
+const REST_MAX_DELAY_MS = 3000;
 
-/**
- * Connects to the Nura backend WebSocket with exponential-backoff reconnect
- * and auto-falls-back to REST when the socket is unavailable for a send.
- *
- * Caller passes events as a ref-stable object via a callback to keep
- * the effect dependency list stable.
- */
 export function useChatSocket(
   apiUrl: string,
   events: ChatSocketEvents
@@ -85,14 +114,33 @@ export function useChatSocket(
         return;
       }
       const e = eventsRef.current;
+      const targetUserId = (data as { userId?: string }).userId ?? null;
+
       if (data.type === "typing") {
-        e.onTyping();
+        if (targetUserId) e.onTyping(targetUserId);
+      } else if (data.type === "fragment_received") {
+        if (targetUserId) {
+          e.onFragmentReceived(targetUserId, data.pending ?? 0);
+        }
       } else if (data.type === "segment" && typeof data.text === "string") {
-        e.onSegment(data.text, data.index ?? 0, data.total ?? 1);
+        if (targetUserId) {
+          e.onSegment(
+            targetUserId,
+            data.text,
+            data.index ?? 0,
+            data.total ?? 1
+          );
+        }
       } else if (data.type === "done") {
-        e.onDone(Boolean(data.crisis));
+        if (targetUserId) {
+          e.onDone(
+            targetUserId,
+            Boolean(data.crisis),
+            (data.state ?? undefined) as BackendState | undefined
+          );
+        }
       } else if (data.type === "error") {
-        e.onError(data.message ?? "Server error");
+        e.onError(targetUserId, data.message ?? "Server error");
       }
     };
 
@@ -102,7 +150,7 @@ export function useChatSocket(
     };
 
     ws.onerror = () => {
-      // onclose will fire and trigger reconnect; don't double-call close().
+      // onclose follows; let it handle reconnect.
     };
   }, [wsUrl]);
 
@@ -136,14 +184,12 @@ export function useChatSocket(
   }, [connect]);
 
   const send = useCallback(
-    (payload: SendPayload): "ws" | "rest" | "queued" => {
+    (payload: SendPayload): "ws" | "rest" => {
       const wire = {
         type: "chat" as const,
         userId: payload.userId,
         message: payload.message,
-        displayName: payload.displayName,
-        tone: payload.tone,
-        timestamp: new Date().toISOString(),
+        timestamp: payload.timestamp ?? new Date().toISOString(),
       };
 
       if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -155,39 +201,61 @@ export function useChatSocket(
         }
       }
 
-      // REST fallback — caller wires the response via the same events bus.
-      fetch(`${apiUrl}/api/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(wire),
-      })
-        .then(async (res) => {
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          return res.json();
-        })
-        .then((data) => {
-          const segs: Array<string | { text: string }> = Array.isArray(
-            data?.segments
-          )
-            ? data.segments
-            : [];
-          eventsRef.current.onTyping();
-          segs.forEach((seg, i) => {
-            const text = typeof seg === "string" ? seg : seg.text;
-            eventsRef.current.onSegment(text, i, segs.length);
-          });
-          eventsRef.current.onDone(Boolean(data?.crisis));
-        })
-        .catch((err) => {
-          console.error("[nura] REST fallback error:", err);
-          eventsRef.current.onError(
-            "Couldn't reach Nura. Check your connection and try again."
-          );
-        });
+      // REST fallback — emulate WS pacing using the server's `delay_ms`.
+      void runRestFallback(apiUrl, wire, eventsRef.current);
       return "rest";
     },
     [apiUrl]
   );
 
   return { isConnected, send };
+}
+
+async function runRestFallback(
+  apiUrl: string,
+  wire: { userId: string; message: string; timestamp: string },
+  events: ChatSocketEvents
+): Promise<void> {
+  try {
+    events.onTyping(wire.userId);
+    const res = await fetch(`${apiUrl}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(wire),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data: {
+      segments?: Array<string | { text: string; delay_ms?: number }>;
+      state?: BackendState;
+      crisis?: boolean;
+    } = await res.json();
+
+    const segs = Array.isArray(data?.segments) ? data.segments : [];
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i];
+      const text = typeof seg === "string" ? seg : seg.text;
+      const delay =
+        typeof seg === "string" ? 0 : Math.max(0, seg.delay_ms ?? 0);
+      if (i > 0) {
+        const clamped = Math.min(
+          REST_MAX_DELAY_MS,
+          Math.max(REST_MIN_DELAY_MS, delay)
+        );
+        if (clamped > 0) await sleep(clamped);
+      }
+      events.onSegment(wire.userId, text, i, segs.length);
+    }
+
+    events.onDone(wire.userId, Boolean(data?.crisis), data?.state);
+  } catch (err) {
+    console.error("[nura] REST fallback error:", err);
+    events.onError(
+      wire.userId,
+      "Couldn't reach Nura. Check your connection and try again."
+    );
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
