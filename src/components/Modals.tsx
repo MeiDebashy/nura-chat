@@ -99,6 +99,8 @@ type SettingsModalProps = {
   onClearHistory: () => void;
   hasHistory: boolean;
   isConnected: boolean;
+  onOpenPrivacy?: () => void;
+  onOpenTerms?: () => void;
 };
 
 export function SettingsModal({
@@ -112,6 +114,8 @@ export function SettingsModal({
   onClearHistory,
   hasHistory,
   isConnected,
+  onOpenPrivacy,
+  onOpenTerms,
 }: SettingsModalProps) {
   return (
     <Modal open={open} onClose={onClose} title="Settings">
@@ -205,6 +209,34 @@ export function SettingsModal({
             </span>
           </div>
         </section>
+
+        {(onOpenPrivacy || onOpenTerms) && (
+          <section>
+            <div className="text-[11px] uppercase tracking-wider text-gray-500 font-semibold mb-2">
+              Legal
+            </div>
+            <div className="flex flex-col gap-1">
+              {onOpenPrivacy && (
+                <button
+                  type="button"
+                  onClick={onOpenPrivacy}
+                  className="text-left text-[13px] text-gray-300 hover:text-white px-3 py-2 rounded-lg hover:bg-white/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60 transition-colors"
+                >
+                  Privacy policy
+                </button>
+              )}
+              {onOpenTerms && (
+                <button
+                  type="button"
+                  onClick={onOpenTerms}
+                  className="text-left text-[13px] text-gray-300 hover:text-white px-3 py-2 rounded-lg hover:bg-white/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60 transition-colors"
+                >
+                  Terms of service
+                </button>
+              )}
+            </div>
+          </section>
+        )}
 
         <section>
           <div className="text-[11px] uppercase tracking-wider text-gray-500 font-semibold mb-2">

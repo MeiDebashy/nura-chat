@@ -42,67 +42,75 @@ export function useSupabaseAuth(): AuthApi {
   const [status, setStatus] = useState<AuthStatus>({ kind: "loading" });
 
   useEffect(() => {
-    if (!isSupabaseConfigured()) {
-      setStatus({ kind: "unconfigured" });
-      return;
-    }
-    const supabase = getSupabaseClient();
     let cancelled = false;
+    let unsubscribe: (() => void) | undefined;
 
-    async function bootstrap() {
-      const { data: existing, error: getErr } = await supabase.auth.getSession();
-      if (cancelled) return;
-      if (getErr) {
-        setStatus({ kind: "error", message: getErr.message });
+    async function init() {
+      if (!isSupabaseConfigured()) {
+        setStatus({ kind: "unconfigured" });
         return;
       }
-      if (existing.session) {
-        applySession(existing.session);
-        return;
+      const supabase = await getSupabaseClient();
+
+      async function bootstrap() {
+        const { data: existing, error: getErr } = await supabase.auth.getSession();
+        if (cancelled) return;
+        if (getErr) {
+          setStatus({ kind: "error", message: getErr.message });
+          return;
+        }
+        if (existing.session) {
+          applySession(existing.session);
+          return;
+        }
+        const { data: anon, error: anonErr } =
+          await supabase.auth.signInAnonymously();
+        if (cancelled) return;
+        if (anonErr || !anon.session) {
+          setStatus({
+            kind: "error",
+            message:
+              anonErr?.message ??
+              "Couldn't start an anonymous session. Make sure anonymous sign-ins are enabled in Supabase.",
+          });
+          return;
+        }
+        applySession(anon.session);
       }
-      const { data: anon, error: anonErr } =
-        await supabase.auth.signInAnonymously();
-      if (cancelled) return;
-      if (anonErr || !anon.session) {
+
+      function applySession(session: Session) {
+        const user = session.user;
+        const isAnon = Boolean(
+          // Supabase exposes is_anonymous on the user object since 2024.
+          (user as User & { is_anonymous?: boolean }).is_anonymous
+        );
         setStatus({
-          kind: "error",
-          message:
-            anonErr?.message ??
-            "Couldn't start an anonymous session. Make sure anonymous sign-ins are enabled in Supabase.",
+          kind: isAnon ? "anonymous" : "authenticated",
+          session,
+          user,
         });
-        return;
       }
-      applySession(anon.session);
-    }
 
-    function applySession(session: Session) {
-      const user = session.user;
-      const isAnon = Boolean(
-        // Supabase exposes is_anonymous on the user object since 2024.
-        (user as User & { is_anonymous?: boolean }).is_anonymous
-      );
-      setStatus({
-        kind: isAnon ? "anonymous" : "authenticated",
-        session,
-        user,
+      await bootstrap();
+
+      const sub = supabase.auth.onAuthStateChange((_event, session) => {
+        if (cancelled) return;
+        if (!session) {
+          // Signed out — re-bootstrap as anonymous.
+          bootstrap();
+          return;
+        }
+        applySession(session);
       });
+
+      unsubscribe = () => sub.data.subscription.unsubscribe();
     }
 
-    bootstrap();
-
-    const sub = supabase.auth.onAuthStateChange((_event, session) => {
-      if (cancelled) return;
-      if (!session) {
-        // Signed out — re-bootstrap as anonymous.
-        bootstrap();
-        return;
-      }
-      applySession(session);
-    });
+    init();
 
     return () => {
       cancelled = true;
-      sub.data.subscription.unsubscribe();
+      unsubscribe?.();
     };
   }, []);
 
@@ -112,7 +120,7 @@ export function useSupabaseAuth(): AuthApi {
     if (!isSupabaseConfigured()) {
       return { error: "Auth is not configured." };
     }
-    const supabase = getSupabaseClient();
+    const supabase = await getSupabaseClient();
     // updateUser triggers a confirmation email that, when clicked,
     // promotes the anonymous user to a permanent one (same uid).
     const { error } = await supabase.auth.updateUser({ email });
@@ -125,7 +133,7 @@ export function useSupabaseAuth(): AuthApi {
     if (!isSupabaseConfigured()) {
       return { error: "Auth is not configured." };
     }
-    const supabase = getSupabaseClient();
+    const supabase = await getSupabaseClient();
     const { error } = await supabase.auth.signInWithOtp({
       email,
       options: {
@@ -137,7 +145,7 @@ export function useSupabaseAuth(): AuthApi {
 
   const signOut = async (): Promise<void> => {
     if (!isSupabaseConfigured()) return;
-    const supabase = getSupabaseClient();
+    const supabase = await getSupabaseClient();
     await supabase.auth.signOut();
   };
 

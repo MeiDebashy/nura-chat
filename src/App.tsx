@@ -20,6 +20,8 @@ import { useOnline } from "./lib/useOnline";
 import { useSupabaseAuth } from "./lib/useSupabaseAuth";
 import { ConsentGate, hasConsented } from "./components/ConsentGate";
 import { LoveConsentModal } from "./components/LoveConsentModal";
+import PrivacyPage from "./components/PrivacyPage";
+import TermsPage from "./components/TermsPage";
 
 const API_URL = (
   import.meta.env.VITE_API_URL ||
@@ -109,6 +111,7 @@ export default function App() {
   const [activeModal, setActiveModal] = useState<
     "settings" | "account" | null
   >(null);
+  const [legalPage, setLegalPage] = useState<"privacy" | "terms" | null>(null);
   const [memberSince] = useState(() => getMemberSince());
   const [confirm, setConfirm] = useState<null | {
     title: string;
@@ -897,6 +900,14 @@ export default function App() {
         onClearHistory={handleClearAll}
         hasHistory={conversations.length > 0}
         isConnected={isConnected}
+        onOpenPrivacy={() => {
+          setActiveModal(null);
+          setLegalPage("privacy");
+        }}
+        onOpenTerms={() => {
+          setActiveModal(null);
+          setLegalPage("terms");
+        }}
       />
       <AccountModal
         open={activeModal === "account"}
@@ -945,6 +956,14 @@ export default function App() {
             );
           }}
         />
+      )}
+
+      {/* Legal pages — full-screen overlays */}
+      {legalPage === "privacy" && (
+        <PrivacyPage onBack={() => setLegalPage(null)} />
+      )}
+      {legalPage === "terms" && (
+        <TermsPage onBack={() => setLegalPage(null)} />
       )}
     </div>
   );
