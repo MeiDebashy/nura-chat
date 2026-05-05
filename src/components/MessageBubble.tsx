@@ -102,17 +102,54 @@ export function DaySeparator({ label }: { label: string }) {
   );
 }
 
-export function CrisisBanner() {
+interface CrisisBannerProps {
+  severity?: "concern" | "urgent" | "emergency" | "none";
+}
+
+const CRISIS_COPY = {
+  concern: {
+    title: "It sounds like you're carrying a lot",
+    body: "If it gets heavier, please reach out to someone trained to help. ",
+    border: "border-amber-500/30",
+    bg: "bg-amber-500/10",
+    text: "text-amber-100",
+    sub: "text-amber-200/90",
+  },
+  urgent: {
+    title: "Please consider reaching out for support right now",
+    body: "What you're feeling is serious. A trained person can help you through this. ",
+    border: "border-orange-500/40",
+    bg: "bg-orange-500/15",
+    text: "text-orange-100",
+    sub: "text-orange-200/95",
+  },
+  emergency: {
+    title: "If you're in immediate danger, please reach out now",
+    body: "You're not alone. Please contact a hotline or emergency services. ",
+    border: "border-red-500/50",
+    bg: "bg-red-500/15",
+    text: "text-red-100",
+    sub: "text-red-200/95",
+  },
+} as const;
+
+export function CrisisBanner({ severity = "emergency" }: CrisisBannerProps) {
+  if (severity === "none") return null;
+  const copy =
+    severity === "concern" || severity === "urgent" || severity === "emergency"
+      ? CRISIS_COPY[severity]
+      : CRISIS_COPY.emergency;
+
   return (
     <div
       role="alert"
-      className="mx-auto my-3 max-w-[680px] rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-[13px] text-red-100 leading-relaxed"
+      className={`mx-auto my-3 max-w-[680px] rounded-xl border px-4 py-3 text-[13px] leading-relaxed ${copy.border} ${copy.bg} ${copy.text}`}
     >
-      <div className="font-medium mb-1">If you're in immediate danger</div>
-      <div className="text-red-200/90">
-        You're not alone. Reach out to a local hotline or emergency services.
-        In the US: <span className="font-medium">988</span>. In the UK:{" "}
-        <span className="font-medium">116 123</span>. Otherwise see{" "}
+      <div className="font-medium mb-1">{copy.title}</div>
+      <div className={copy.sub}>
+        {copy.body}
+        US <span className="font-medium">988</span> · UK{" "}
+        <span className="font-medium">116 123</span> ·{" "}
         <a
           href="https://findahelpline.com"
           target="_blank"
@@ -121,7 +158,6 @@ export function CrisisBanner() {
         >
           findahelpline.com
         </a>
-        .
       </div>
     </div>
   );

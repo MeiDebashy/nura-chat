@@ -113,15 +113,25 @@ export function ChatView({
 
   const headerTitle = conversation?.title ?? "Nura";
   const phaseText = phaseLabel(conversation?.phase);
-  const headerSubtitle = !isOnline
-    ? "offline"
-    : isTyping
-    ? "typing…"
-    : !isConnected
-    ? "connecting…"
-    : phaseText
-    ? `${phaseText} · online`
-    : "online";
+  const cooldownActive = conversation?.cooldownActive;
+  const softPresence = conversation?.softPresence;
+
+  let headerSubtitle: string;
+  if (!isOnline) {
+    headerSubtitle = "offline";
+  } else if (isTyping) {
+    headerSubtitle = "typing…";
+  } else if (!isConnected) {
+    headerSubtitle = "connecting…";
+  } else if (softPresence) {
+    headerSubtitle = "needs space";
+  } else if (cooldownActive) {
+    headerSubtitle = "in cooldown";
+  } else if (phaseText) {
+    headerSubtitle = `${phaseText} · online`;
+  } else {
+    headerSubtitle = "online";
+  }
 
   return (
     <section className="flex-1 flex flex-col h-full min-w-0 bg-[#0a0a0f] relative">
@@ -164,6 +174,8 @@ export function ChatView({
                 ? "text-red-400/90"
                 : isTyping
                 ? "text-cyan-400"
+                : softPresence || cooldownActive
+                ? "text-gray-400/90"
                 : isConnected
                 ? "text-emerald-400/90"
                 : "text-amber-400/90"
@@ -185,8 +197,16 @@ export function ChatView({
         </div>
       )}
 
-      {/* Crisis banner */}
-      {conversation?.crisis && <CrisisBanner />}
+      {/* Crisis banner — severity-aware (concern → urgent → emergency) */}
+      {conversation?.crisis &&
+        conversation.crisisSeverity &&
+        conversation.crisisSeverity !== "none" && (
+          <CrisisBanner severity={conversation.crisisSeverity} />
+        )}
+      {/* Fallback: legacy boolean crisis flag without severity → emergency */}
+      {conversation?.crisis && !conversation.crisisSeverity && (
+        <CrisisBanner severity="emergency" />
+      )}
 
       {/* Send error banner */}
       {sendError && (

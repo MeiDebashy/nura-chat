@@ -15,9 +15,10 @@ import {
   saveConversations,
 } from "./lib/storage";
 import { uuid } from "./lib/uuid";
-import { useChatSocket, type BackendState } from "./lib/useChatSocket";
+import { useChatSocket, type DoneInfo } from "./lib/useChatSocket";
 import { useOnline } from "./lib/useOnline";
 import { ConsentGate, hasConsented } from "./components/ConsentGate";
+import { LoveConsentModal } from "./components/LoveConsentModal";
 
 const API_URL = (
   import.meta.env.VITE_API_URL ||
@@ -163,7 +164,10 @@ export default function App() {
   const decodeConversationId = useCallback(
     (wireUserId: string | null): string | null => {
       if (!wireUserId) return null;
-      const sep = wireUserId.indexOf(":");
+      // Split on the LAST colon so a future colon-bearing baseUserId
+      // (e.g. "auth0|123") still parses correctly. The conversationId
+      // half is always a UUID and never contains a colon.
+      const sep = wireUserId.lastIndexOf(":");
       if (sep === -1) return null;
       return wireUserId.slice(sep + 1) || null;
     },
@@ -203,22 +207,54 @@ export default function App() {
           )
         );
       },
-      onDone(wireUserId: string, crisis: boolean, state?: BackendState) {
+      onDone(wireUserId: string, info: DoneInfo) {
         const cid = decodeConversationId(wireUserId);
         if (!cid) return;
         if (replyTargetIdRef.current === cid) {
           setTypingForId(null);
           replyTargetIdRef.current = null;
         }
-        const phase = state?.phase?.current_phase;
+        const phaseState = info.state?.phase;
+        const elasticityState = info.state?.elasticity;
+        const phaseNum = phaseState?.current_phase;
         const isViewing = cid === activeIdLatestRef.current;
+
+        // Build the love-consent prompt object iff backend says it's pending
+        // and the user hasn't yet granted/declined.
+        let loveConsent: { promptedAt: string; eligibleAt: string } | null =
+          null;
+        const promptedAt = phaseState?.love_phase_consent_prompt_timestamp;
+        const eligibleAt = phaseState?.love_phase_consent_eligible_at;
+        const granted = phaseState?.love_phase_consent_granted ?? false;
+        if (!granted && promptedAt && eligibleAt) {
+          loveConsent = { promptedAt, eligibleAt };
+        }
+
         setConversations((prev) =>
           prev.map((c) =>
             c.id === cid
               ? {
                   ...c,
-                  crisis: c.crisis || crisis,
-                  phase: typeof phase === "number" ? phase : c.phase,
+                  // crisis is sticky (once a conversation is flagged it stays
+                  // flagged) but severity tracks the latest message
+                  crisis: c.crisis || info.crisis,
+                  crisisSeverity:
+                    info.crisisSeverity ?? c.crisisSeverity ?? "none",
+                  crisisType: info.crisisType ?? c.crisisType ?? null,
+
+                  phase: typeof phaseNum === "number" ? phaseNum : c.phase,
+                  cooldownActive: phaseState?.cooldown_active ?? false,
+                  cooldownReason: phaseState?.cooldown_reason ?? null,
+                  cooldownExpiresAt: phaseState?.cooldown_expires_at ?? null,
+
+                  softPresence:
+                    elasticityState?.soft_presence_mode_active ?? false,
+
+                  loveConsent,
+                  loveConsentGranted: granted,
+                  loveConsentDeclinedAt:
+                    phaseState?.love_phase_consent_declined_timestamp ?? null,
+
                   // Increment unread once per reply (not per segment) when
                   // user is on a different conversation.
                   unread: isViewing ? 0 : (c.unread ?? 0) + 1,
@@ -324,6 +360,51 @@ export default function App() {
       });
     },
     [activeId, composeWireUserId, inputValue, send, typingForId]
+  );
+
+  // ── Love-phase consent (Blueprint #1) ──────────────────────────────────
+  const handleLoveConsent = useCallback(
+    async (conversationId: string, decision: "grant" | "decline") => {
+      try {
+        const res = await fetch(`${API_URL}/api/love-consent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            userId: composeWireUserId(conversationId),
+            decision,
+            timestamp: new Date().toISOString(),
+          }),
+        });
+        const data = (await res.json()) as {
+          success?: boolean;
+          error?: string;
+        };
+        if (!res.ok || !data.success) {
+          setSendError(
+            data.error ?? "Couldn't record your decision. Try again."
+          );
+          return;
+        }
+        // Optimistically update state; the next `done` will refresh fully.
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === conversationId
+              ? {
+                  ...c,
+                  loveConsent: null,
+                  loveConsentGranted: decision === "grant",
+                  loveConsentDeclinedAt:
+                    decision === "decline" ? new Date().toISOString() : null,
+                }
+              : c
+          )
+        );
+      } catch (err) {
+        console.error("[nura] consent error:", err);
+        setSendError("Couldn't reach Nura. Try again.");
+      }
+    },
+    [composeWireUserId]
   );
 
   // ── Conversation operations ─────────────────────────────────────────────
@@ -673,6 +754,27 @@ export default function App() {
         onConfirm={() => confirm?.onConfirm()}
         onClose={() => setConfirm(null)}
       />
+
+      {/* Love-phase consent prompt (Blueprint #1) — only on the active chat */}
+      {active?.loveConsent && (
+        <LoveConsentModal
+          open={true}
+          conversationTitle={active.title}
+          promptedAt={active.loveConsent.promptedAt}
+          eligibleAt={active.loveConsent.eligibleAt}
+          onGrant={() => handleLoveConsent(active.id, "grant")}
+          onDecline={() => handleLoveConsent(active.id, "decline")}
+          onClose={() => {
+            // "Take more time" — clear the prompt locally; backend keeps
+            // the timestamp set so the prompt re-appears on next `done`.
+            setConversations((prev) =>
+              prev.map((c) =>
+                c.id === active.id ? { ...c, loveConsent: null } : c
+              )
+            );
+          }}
+        />
+      )}
     </div>
   );
 }

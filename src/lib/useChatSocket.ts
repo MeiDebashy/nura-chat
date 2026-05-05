@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ServerMsg } from "./types";
+import type { CrisisSeverity, CrisisType, ServerMsg } from "./types";
 
 /**
  * Wire contract — mirrors nura-emotional-core/src/server/index.ts
@@ -24,8 +24,33 @@ import type { ServerMsg } from "./types";
  *   so each conversation gets its own NuraLLM session + state on the server.
  */
 
+/**
+ * Subset of nura-emotional-core's `UserState` that the frontend reads.
+ * Mirrors PhaseState + ElasticityState; everything else is currently
+ * ignored (kept on the wire so future UI can pick it up without protocol
+ * changes).
+ */
 export interface BackendState {
-  phase?: { current_phase?: number };
+  phase?: {
+    current_phase?: number;
+    cooldown_active?: boolean;
+    cooldown_expires_at?: string | null;
+    cooldown_reason?: string | null;
+    love_phase_consent_granted?: boolean;
+    love_phase_consent_prompt_timestamp?: string | null;
+    love_phase_consent_eligible_at?: string | null;
+    love_phase_consent_declined_timestamp?: string | null;
+  };
+  elasticity?: {
+    soft_presence_mode_active?: boolean;
+  };
+}
+
+export interface DoneInfo {
+  crisis: boolean;
+  crisisSeverity?: CrisisSeverity;
+  crisisType?: CrisisType | null;
+  state?: BackendState;
 }
 
 export interface ChatSocketEvents {
@@ -37,7 +62,7 @@ export interface ChatSocketEvents {
     index: number,
     total: number
   ): void;
-  onDone(targetUserId: string, crisis: boolean, state?: BackendState): void;
+  onDone(targetUserId: string, info: DoneInfo): void;
   onError(targetUserId: string | null, message: string): void;
 }
 
@@ -133,11 +158,12 @@ export function useChatSocket(
         }
       } else if (data.type === "done") {
         if (targetUserId) {
-          e.onDone(
-            targetUserId,
-            Boolean(data.crisis),
-            (data.state ?? undefined) as BackendState | undefined
-          );
+          e.onDone(targetUserId, {
+            crisis: Boolean(data.crisis),
+            crisisSeverity: data.crisis_severity,
+            crisisType: data.crisis_type ?? null,
+            state: (data.state ?? undefined) as BackendState | undefined,
+          });
         }
       } else if (data.type === "error") {
         e.onError(targetUserId, data.message ?? "Server error");
@@ -228,6 +254,8 @@ async function runRestFallback(
       segments?: Array<string | { text: string; delay_ms?: number }>;
       state?: BackendState;
       crisis?: boolean;
+      crisis_severity?: CrisisSeverity;
+      crisis_type?: CrisisType | null;
     } = await res.json();
 
     const segs = Array.isArray(data?.segments) ? data.segments : [];
@@ -246,7 +274,12 @@ async function runRestFallback(
       events.onSegment(wire.userId, text, i, segs.length);
     }
 
-    events.onDone(wire.userId, Boolean(data?.crisis), data?.state);
+    events.onDone(wire.userId, {
+      crisis: Boolean(data?.crisis),
+      crisisSeverity: data?.crisis_severity,
+      crisisType: data?.crisis_type ?? null,
+      state: data?.state,
+    });
   } catch (err) {
     console.error("[nura] REST fallback error:", err);
     events.onError(
