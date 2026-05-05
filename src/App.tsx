@@ -17,6 +17,7 @@ import {
 import { uuid } from "./lib/uuid";
 import { useChatSocket, type DoneInfo } from "./lib/useChatSocket";
 import { useOnline } from "./lib/useOnline";
+import { useSupabaseAuth } from "./lib/useSupabaseAuth";
 import { ConsentGate, hasConsented } from "./components/ConsentGate";
 import { LoveConsentModal } from "./components/LoveConsentModal";
 
@@ -28,13 +29,18 @@ const API_URL = (
 const MAX_MESSAGE_LEN = 4000;
 const MAX_TITLE_LEN = 42;
 
-function getUserId(): string {
-  let id = localStorage.getItem(USER_ID_KEY);
-  if (!id) {
-    id = uuid();
-    localStorage.setItem(USER_ID_KEY, id);
-  }
-  return id;
+/**
+ * Returns the LEGACY localStorage userId, if any. We no longer create one
+ * here — Supabase Auth issues the canonical id. This is only consulted on
+ * first authenticated boot, when we migrate any pre-auth state under the
+ * legacy id over to the new auth.uid()-keyed namespace.
+ */
+function getLegacyUserId(): string | null {
+  return localStorage.getItem(USER_ID_KEY);
+}
+
+function clearLegacyUserId(): void {
+  localStorage.removeItem(USER_ID_KEY);
 }
 
 function getMemberSince(): number {
@@ -112,7 +118,17 @@ export default function App() {
     onConfirm: () => void;
   }>(null);
 
-  const userIdRef = useRef(getUserId());
+  const auth = useSupabaseAuth();
+  const accessToken =
+    auth.status.kind === "anonymous" || auth.status.kind === "authenticated"
+      ? auth.status.session.access_token
+      : null;
+  const authUserId =
+    auth.status.kind === "anonymous" || auth.status.kind === "authenticated"
+      ? auth.status.user.id
+      : null;
+  const isAuthAnonymous = auth.status.kind === "anonymous";
+
   const replyTargetIdRef = useRef<string | null>(null);
   const displayNameRef = useRef(displayName);
   const toneRef = useRef(tone);
@@ -155,25 +171,20 @@ export default function App() {
     activeIdLatestRef.current = activeId;
   }, [activeId]);
 
-  // ── Wire userId ↔ conversationId ───────────────────────────────────────
-  // The backend keys NuraLLM sessions by `userId`. We send a composite id
-  // `${baseUserId}:${conversationId}` so each chat has its own emotional
-  // history (phase, elasticity, repetition, anchor scheduler).
-  // Server echoes our composite back in every event — we use it to route
-  // segments/done/typing/error to the right conversation in state.
-  const composeWireUserId = useCallback(
-    (conversationId: string) => `${userIdRef.current}:${conversationId}`,
-    []
-  );
-
+  // ── Routing helpers ────────────────────────────────────────────────────
+  // The wire now sends only `conversationId`; the backend composes the
+  // storage key from the verified JWT + conversationId. Server still
+  // echoes the full key back in every event so we can route reliably.
   const decodeConversationId = useCallback(
     (wireUserId: string | null): string | null => {
       if (!wireUserId) return null;
-      // Split on the LAST colon so a future colon-bearing baseUserId
-      // (e.g. "auth0|123") still parses correctly. The conversationId
-      // half is always a UUID and never contains a colon.
+      // Server's composite is `${auth.uid()}:${conversationId}`; both halves
+      // are colon-free in practice, but use lastIndexOf for safety.
       const sep = wireUserId.lastIndexOf(":");
-      if (sep === -1) return null;
+      if (sep === -1) {
+        // User-scoped event (no conversation suffix) — caller can ignore.
+        return null;
+      }
       return wireUserId.slice(sep + 1) || null;
     },
     []
@@ -314,7 +325,65 @@ export default function App() {
     [decodeConversationId]
   );
 
-  const { isConnected, send } = useChatSocket(API_URL, socketEvents);
+  const { isConnected, send } = useChatSocket(
+    API_URL,
+    accessToken,
+    socketEvents
+  );
+
+  // ── Adopt legacy localStorage userId on first authenticated boot ──────
+  // Pre-auth versions of this app keyed everything in the backend off a
+  // device-local UUID stored in localStorage. Now that Supabase issues
+  // the canonical id, transfer any prior backend state under the legacy
+  // id over to the auth.uid()-keyed namespace, then clear the legacy id.
+  // Idempotent: if there's no legacy id, no-op.
+  const adoptedRef = useRef(false);
+  useEffect(() => {
+    if (adoptedRef.current) return;
+    if (!accessToken) return;
+    const legacy = getLegacyUserId();
+    if (!legacy) {
+      adoptedRef.current = true;
+      return;
+    }
+    const ids = conversations.map((c) => c.id);
+    if (ids.length === 0) {
+      // Nothing to adopt — just clear the legacy id.
+      clearLegacyUserId();
+      adoptedRef.current = true;
+      return;
+    }
+    adoptedRef.current = true;
+    fetch(`${API_URL}/api/auth/adopt`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({
+        legacy_user_id: legacy,
+        conversation_ids: ids,
+      }),
+    })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as {
+          adopted?: number;
+          skipped?: number;
+        };
+        console.info(
+          `[nura] Adopted legacy state: ${data.adopted ?? 0} carried over, ${
+            data.skipped ?? 0
+          } skipped.`
+        );
+        clearLegacyUserId();
+      })
+      .catch((err) => {
+        // If adoption fails (offline, etc.) we'll retry next boot.
+        console.warn("[nura] Adopt failed; will retry next boot:", err);
+        adoptedRef.current = false;
+      });
+  }, [accessToken, conversations]);
 
   // ── Sending ─────────────────────────────────────────────────────────────
 
@@ -378,24 +447,30 @@ export default function App() {
       setInputValue("");
 
       send({
-        userId: composeWireUserId(targetId),
+        conversationId: targetId,
         message: messageText,
       });
     },
-    [activeId, composeWireUserId, inputValue, send, typingForId]
+    [activeId, inputValue, send, typingForId]
   );
 
   // ── Love-phase consent (Blueprint #1) ──────────────────────────────────
   const handleLoveConsent = useCallback(
     async (conversationId: string, decision: "grant" | "decline") => {
+      if (!accessToken) {
+        setSendError("Not signed in yet. Try again in a moment.");
+        return;
+      }
       try {
         const res = await fetch(`${API_URL}/api/love-consent`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${accessToken}`,
+          },
           body: JSON.stringify({
-            userId: composeWireUserId(conversationId),
+            conversationId,
             decision,
-            timestamp: new Date().toISOString(),
           }),
         });
         const data = (await res.json()) as {
@@ -427,7 +502,7 @@ export default function App() {
         setSendError("Couldn't reach Nura. Try again.");
       }
     },
-    [composeWireUserId]
+    [accessToken]
   );
 
   // ── Conversation operations ─────────────────────────────────────────────
@@ -473,17 +548,22 @@ export default function App() {
           }
           // Wipe the corresponding backend session so emotional state
           // doesn't linger after the user explicitly deleted the chat.
-          fetch(`${API_URL}/api/session`, {
-            method: "DELETE",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ userId: composeWireUserId(id) }),
-          }).catch((err) => {
-            console.warn("[nura] /api/session DELETE failed:", err);
-          });
+          if (accessToken) {
+            fetch(`${API_URL}/api/session`, {
+              method: "DELETE",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${accessToken}`,
+              },
+              body: JSON.stringify({ conversationId: id }),
+            }).catch((err) => {
+              console.warn("[nura] /api/session DELETE failed:", err);
+            });
+          }
         },
       });
     },
-    [activeId, composeWireUserId, conversations]
+    [accessToken, activeId, conversations]
   );
 
   const handleClearAll = useCallback(() => {
@@ -647,11 +727,11 @@ export default function App() {
       // Don't preemptively show "typing" — the backend's MessageCollector
       // may buffer this resend with other fragments before processing.
       send({
-        userId: composeWireUserId(conv.id),
+        conversationId: conv.id,
         message: message.text,
       });
     },
-    [composeWireUserId, conversations, send, typingForId]
+    [conversations, send, typingForId]
   );
 
   const isReplyForActive = typingForId !== null && typingForId === activeId;
@@ -669,6 +749,54 @@ export default function App() {
 
   if (!consented) {
     return <ConsentGate onAccept={() => setConsented(true)} />;
+  }
+
+  // Auth bootstrap gate. This is short — usually a few hundred ms — but if
+  // Supabase env vars are missing, we surface the misconfiguration clearly
+  // rather than letting the chat fail silently.
+  if (auth.status.kind === "loading") {
+    return (
+      <div className="h-[100dvh] w-full bg-[#0a0a0f] text-gray-400 flex items-center justify-center">
+        <div className="text-[13px]">Connecting…</div>
+      </div>
+    );
+  }
+  if (auth.status.kind === "unconfigured") {
+    return (
+      <div className="h-[100dvh] w-full bg-[#0a0a0f] text-gray-100 flex items-center justify-center p-6">
+        <div className="max-w-md text-center">
+          <div className="text-[16px] font-medium mb-2">
+            Auth not configured
+          </div>
+          <div className="text-[13px] text-gray-400 leading-relaxed">
+            Set <code className="text-cyan-400">VITE_SUPABASE_URL</code> and{" "}
+            <code className="text-cyan-400">VITE_SUPABASE_ANON_KEY</code> in
+            your Vercel project's environment variables, then redeploy.
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (auth.status.kind === "error") {
+    return (
+      <div className="h-[100dvh] w-full bg-[#0a0a0f] text-gray-100 flex items-center justify-center p-6">
+        <div className="max-w-md text-center">
+          <div className="text-[16px] font-medium mb-2 text-red-300">
+            Couldn't sign you in
+          </div>
+          <div className="text-[13px] text-gray-400 leading-relaxed mb-4">
+            {auth.status.message}
+          </div>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="px-4 py-2 rounded-lg text-[13px] bg-cyan-500 hover:bg-cyan-400 text-[#0a0a0f] focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
+          >
+            Reload
+          </button>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -775,11 +903,18 @@ export default function App() {
         onClose={() => setActiveModal(null)}
         displayName={displayName}
         onDisplayNameChange={setDisplayName}
-        userId={userIdRef.current}
+        userId={authUserId ?? ""}
         memberSince={memberSince}
         conversationCount={conversations.length}
         messageCount={messageCount}
         onResetAll={handleResetAll}
+        isAnonymous={isAuthAnonymous}
+        userEmail={
+          auth.status.kind === "authenticated" ? auth.status.user.email : null
+        }
+        onClaimWithEmail={auth.claimWithEmail}
+        onSignInWithEmail={auth.signInWithEmail}
+        onSignOut={auth.signOut}
       />
       <ConfirmDialog
         open={confirm !== null}

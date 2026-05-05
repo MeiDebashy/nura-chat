@@ -67,14 +67,13 @@ export interface ChatSocketEvents {
 }
 
 export interface SendPayload {
-  userId: string; // composite: base:conversationId
+  conversationId: string;
   message: string;
-  timestamp?: string;
 }
 
 export interface ChatSocketHandle {
   isConnected: boolean;
-  send(payload: SendPayload): "ws" | "rest";
+  send(payload: SendPayload): "ws" | "rest" | "no_token";
 }
 
 const RECONNECT_BASE_MS = 1000;
@@ -84,14 +83,22 @@ const RECONNECT_MAX_MS = 30000;
 const REST_MIN_DELAY_MS = 0;
 const REST_MAX_DELAY_MS = 3000;
 
+/**
+ * @param apiUrl     Backend HTTP base URL.
+ * @param accessToken Supabase JWT (HS256). The hook reconnects the WS
+ *                   when this changes (e.g. token refresh, sign-in).
+ *                   Pass null to suspend the connection.
+ */
 export function useChatSocket(
   apiUrl: string,
+  accessToken: string | null,
   events: ChatSocketEvents
 ): ChatSocketHandle {
   const [isConnected, setIsConnected] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const eventsRef = useRef(events);
+  const tokenRef = useRef<string | null>(accessToken);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined
   );
@@ -102,11 +109,23 @@ export function useChatSocket(
     eventsRef.current = events;
   }, [events]);
 
-  const wsUrl = apiUrl.replace(/^http/, "ws") + "/ws";
+  useEffect(() => {
+    tokenRef.current = accessToken;
+  }, [accessToken]);
+
+  const baseWsUrl = apiUrl.replace(/^http/, "ws") + "/ws";
+  const wsUrlWithToken = (token: string) =>
+    `${baseWsUrl}?access_token=${encodeURIComponent(token)}`;
 
   const scheduleReconnect = useRef<() => void>(() => {});
   const connect = useCallback(() => {
     if (isUnmountingRef.current) return;
+    const token = tokenRef.current;
+    if (!token) {
+      // No JWT yet — wait. Auth bootstrap will trigger another connect via
+      // the effect dependency on accessToken.
+      return;
+    }
     const existing = wsRef.current;
     if (
       existing &&
@@ -118,7 +137,7 @@ export function useChatSocket(
 
     let ws: WebSocket;
     try {
-      ws = new WebSocket(wsUrl);
+      ws = new WebSocket(wsUrlWithToken(token));
     } catch (err) {
       console.error("[nura] WebSocket construction failed:", err);
       scheduleReconnect.current();
@@ -178,7 +197,7 @@ export function useChatSocket(
     ws.onerror = () => {
       // onclose follows; let it handle reconnect.
     };
-  }, [wsUrl]);
+  }, [baseWsUrl]);
 
   scheduleReconnect.current = () => {
     if (isUnmountingRef.current) return;
@@ -194,6 +213,21 @@ export function useChatSocket(
 
   useEffect(() => {
     isUnmountingRef.current = false;
+    // Tear down any existing socket — the token may have changed.
+    const previous = wsRef.current;
+    if (previous) {
+      previous.onopen = null;
+      previous.onmessage = null;
+      previous.onclose = null;
+      previous.onerror = null;
+      try {
+        previous.close();
+      } catch {
+        // ignore
+      }
+      wsRef.current = null;
+      setIsConnected(false);
+    }
     connect();
     return () => {
       isUnmountingRef.current = true;
@@ -207,15 +241,17 @@ export function useChatSocket(
         ws.close();
       }
     };
-  }, [connect]);
+  }, [connect, accessToken]);
 
   const send = useCallback(
-    (payload: SendPayload): "ws" | "rest" => {
+    (payload: SendPayload): "ws" | "rest" | "no_token" => {
+      const token = tokenRef.current;
+      if (!token) return "no_token";
+
       const wire = {
         type: "chat" as const,
-        userId: payload.userId,
+        conversationId: payload.conversationId,
         message: payload.message,
-        timestamp: payload.timestamp ?? new Date().toISOString(),
       };
 
       if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -228,7 +264,7 @@ export function useChatSocket(
       }
 
       // REST fallback — emulate WS pacing using the server's `delay_ms`.
-      void runRestFallback(apiUrl, wire, eventsRef.current);
+      void runRestFallback(apiUrl, token, wire, eventsRef.current);
       return "rest";
     },
     [apiUrl]
@@ -239,14 +275,22 @@ export function useChatSocket(
 
 async function runRestFallback(
   apiUrl: string,
-  wire: { userId: string; message: string; timestamp: string },
+  accessToken: string,
+  wire: { conversationId: string; message: string },
   events: ChatSocketEvents
 ): Promise<void> {
+  // The REST handler expects an Authorization header — composite key is
+  // computed server-side from the verified JWT + conversationId. We use
+  // the conversationId locally as a routing token for the events.
+  const routingId = wire.conversationId;
   try {
-    events.onTyping(wire.userId);
+    events.onTyping(routingId);
     const res = await fetch(`${apiUrl}/api/chat`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
       body: JSON.stringify(wire),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -271,10 +315,10 @@ async function runRestFallback(
         );
         if (clamped > 0) await sleep(clamped);
       }
-      events.onSegment(wire.userId, text, i, segs.length);
+      events.onSegment(routingId, text, i, segs.length);
     }
 
-    events.onDone(wire.userId, {
+    events.onDone(routingId, {
       crisis: Boolean(data?.crisis),
       crisisSeverity: data?.crisis_severity,
       crisisType: data?.crisis_type ?? null,
@@ -283,7 +327,7 @@ async function runRestFallback(
   } catch (err) {
     console.error("[nura] REST fallback error:", err);
     events.onError(
-      wire.userId,
+      routingId,
       "Couldn't reach Nura. Check your connection and try again."
     );
   }

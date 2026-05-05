@@ -230,6 +230,12 @@ type AccountModalProps = {
   conversationCount: number;
   messageCount: number;
   onResetAll: () => void;
+  // Auth-aware fields. Optional so other callers can omit them.
+  isAnonymous?: boolean;
+  userEmail?: string | null;
+  onClaimWithEmail?: (email: string) => Promise<{ error: string | null }>;
+  onSignInWithEmail?: (email: string) => Promise<{ error: string | null }>;
+  onSignOut?: () => Promise<void>;
 };
 
 export function AccountModal({
@@ -242,8 +248,19 @@ export function AccountModal({
   conversationCount,
   messageCount,
   onResetAll,
+  isAnonymous,
+  userEmail,
+  onClaimWithEmail,
+  onSignInWithEmail,
+  onSignOut,
 }: AccountModalProps) {
   const [copied, setCopied] = useState(false);
+  const [emailInput, setEmailInput] = useState("");
+  const [emailMode, setEmailMode] = useState<"idle" | "sending" | "sent">(
+    "idle"
+  );
+  const [emailError, setEmailError] = useState<string | null>(null);
+
   const onCopyId = async () => {
     try {
       await navigator.clipboard.writeText(userId);
@@ -252,6 +269,30 @@ export function AccountModal({
     } catch {
       // clipboard unavailable — silently ignore
     }
+  };
+
+  const handleEmailSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const email = emailInput.trim();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setEmailError("Please enter a valid email address.");
+      return;
+    }
+    setEmailError(null);
+    setEmailMode("sending");
+    const handler = isAnonymous ? onClaimWithEmail : onSignInWithEmail;
+    if (!handler) {
+      setEmailError("Auth handler missing.");
+      setEmailMode("idle");
+      return;
+    }
+    const { error } = await handler(email);
+    if (error) {
+      setEmailError(error);
+      setEmailMode("idle");
+      return;
+    }
+    setEmailMode("sent");
   };
 
   const initials = (displayName || "You").trim().slice(0, 1).toUpperCase();
@@ -302,6 +343,79 @@ export function AccountModal({
             </button>
           </div>
         </section>
+
+        {/* Account / sync section — only when auth is wired in */}
+        {(isAnonymous !== undefined || userEmail) && (
+          <section>
+            <div className="text-[11px] uppercase tracking-wider text-gray-500 font-semibold mb-2">
+              Account
+            </div>
+            {userEmail ? (
+              <div className="flex items-center justify-between gap-2 bg-[#0a0a0f] border border-white/10 rounded-lg px-3 py-2.5">
+                <div className="min-w-0">
+                  <div className="text-[13px] text-white truncate">
+                    {userEmail}
+                  </div>
+                  <div className="text-[11px] text-emerald-400">
+                    Synced across devices
+                  </div>
+                </div>
+                {onSignOut && (
+                  <button
+                    type="button"
+                    onClick={() => void onSignOut()}
+                    className="px-3 py-1.5 rounded-lg text-[12px] text-gray-300 border border-white/10 hover:bg-white/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60 transition-colors shrink-0"
+                  >
+                    Sign out
+                  </button>
+                )}
+              </div>
+            ) : isAnonymous && (onClaimWithEmail || onSignInWithEmail) ? (
+              <div>
+                <div className="text-[12.5px] text-gray-400 leading-relaxed mb-3">
+                  You're using Nura anonymously. Add an email to sync this
+                  conversation across devices and recover it if you change
+                  browser. We'll send you a magic link — no password.
+                </div>
+                {emailMode === "sent" ? (
+                  <div className="bg-cyan-500/10 border border-cyan-500/30 rounded-lg px-3 py-2.5 text-[13px] text-cyan-100">
+                    Check your inbox at{" "}
+                    <span className="font-medium">{emailInput}</span>. Open the
+                    magic link to confirm.
+                  </div>
+                ) : (
+                  <form
+                    onSubmit={handleEmailSubmit}
+                    className="flex flex-col gap-2"
+                  >
+                    <input
+                      type="email"
+                      value={emailInput}
+                      onChange={(e) => setEmailInput(e.target.value)}
+                      placeholder="you@example.com"
+                      autoComplete="email"
+                      className="w-full bg-[#0a0a0f] border border-white/10 rounded-lg px-3 py-2.5 text-[14px] text-white placeholder-gray-600 outline-none focus:border-cyan-500/40 transition-colors"
+                    />
+                    {emailError && (
+                      <div className="text-[12px] text-red-300">
+                        {emailError}
+                      </div>
+                    )}
+                    <button
+                      type="submit"
+                      disabled={emailMode === "sending"}
+                      className="w-full px-3 py-2.5 rounded-lg text-[13px] font-medium bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 disabled:cursor-not-allowed text-[#0a0a0f] focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60 transition-colors"
+                    >
+                      {emailMode === "sending"
+                        ? "Sending…"
+                        : "Send magic link"}
+                    </button>
+                  </form>
+                )}
+              </div>
+            ) : null}
+          </section>
+        )}
 
         <section>
           <div className="text-[11px] uppercase tracking-wider text-gray-500 font-semibold mb-2">
