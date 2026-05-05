@@ -20,8 +20,12 @@ import { useOnline } from "./lib/useOnline";
 import { useSupabaseAuth } from "./lib/useSupabaseAuth";
 import { ConsentGate, hasConsented } from "./components/ConsentGate";
 import { LoveConsentModal } from "./components/LoveConsentModal";
-import PrivacyPage from "./components/PrivacyPage";
-import TermsPage from "./components/TermsPage";
+
+// Canonical legal copy lives on the marketing site.
+// VITE_MARKETING_URL overrides for staging / preview.
+const MARKETING_URL = (
+  import.meta.env.VITE_MARKETING_URL || "https://nura-ai-opal.vercel.app"
+).replace(/\/+$/, "");
 
 const API_URL = (
   import.meta.env.VITE_API_URL ||
@@ -111,7 +115,6 @@ export default function App() {
   const [activeModal, setActiveModal] = useState<
     "settings" | "account" | null
   >(null);
-  const [legalPage, setLegalPage] = useState<"privacy" | "terms" | null>(null);
   const [memberSince] = useState(() => getMemberSince());
   const [confirm, setConfirm] = useState<null | {
     title: string;
@@ -901,12 +904,10 @@ export default function App() {
         hasHistory={conversations.length > 0}
         isConnected={isConnected}
         onOpenPrivacy={() => {
-          setActiveModal(null);
-          setLegalPage("privacy");
+          window.open(`${MARKETING_URL}/privacy`, "_blank", "noopener");
         }}
         onOpenTerms={() => {
-          setActiveModal(null);
-          setLegalPage("terms");
+          window.open(`${MARKETING_URL}/terms`, "_blank", "noopener");
         }}
       />
       <AccountModal
@@ -958,13 +959,6 @@ export default function App() {
         />
       )}
 
-      {/* Legal pages — full-screen overlays */}
-      {legalPage === "privacy" && (
-        <PrivacyPage onBack={() => setLegalPage(null)} />
-      )}
-      {legalPage === "terms" && (
-        <TermsPage onBack={() => setLegalPage(null)} />
-      )}
     </div>
   );
 }
