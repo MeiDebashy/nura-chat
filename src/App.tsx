@@ -77,7 +77,12 @@ function useMediaQuery(query: string): boolean {
   return matches;
 }
 
-const STUCK_MESSAGE_TIMEOUT_MS = 30_000;
+// Watchdog window for messages stuck in "sending". Tuned for fragment
+// buffering: backend's MessageCollector waits ≤2.5s of silence before
+// processing, then the LLM call adds up to ~10s, so the realistic
+// upper bound is ~15s. 60s gives slow-network grace without leaving
+// genuinely-failed messages spinning indefinitely.
+const STUCK_MESSAGE_TIMEOUT_MS = 60_000;
 
 export default function App() {
   const isDesktop = useMediaQuery("(min-width: 768px)");
@@ -351,7 +356,12 @@ export default function App() {
       }
 
       replyTargetIdRef.current = targetId;
-      setTypingForId(targetId);
+      // Do NOT set typingForId here. The backend buffers fragments via
+      // MessageCollector (sentence punctuation OR 2.5s of silence) before
+      // generating one merged reply. typingForId is set when the server's
+      // `typing` event fires — that's the exact moment Nura starts composing,
+      // and only then should the composer lock. Until then the user can chain
+      // fragments freely (the WhatsApp/iMessage feel).
       setInputValue("");
 
       send({
@@ -609,7 +619,8 @@ export default function App() {
         )
       );
       replyTargetIdRef.current = conv.id;
-      setTypingForId(conv.id);
+      // Don't preemptively show "typing" — the backend's MessageCollector
+      // may buffer this resend with other fragments before processing.
       send({
         userId: composeWireUserId(conv.id),
         message: message.text,
