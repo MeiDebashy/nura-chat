@@ -1,10 +1,13 @@
 export type Sender = "user" | "nura";
 
+export type DeliveryStatus = "sending" | "sent" | "failed";
+
 export interface Message {
   id: string;
   text: string;
   sender: Sender;
   timestamp: number;
+  status?: DeliveryStatus;
 }
 
 export interface Conversation {
@@ -13,6 +16,9 @@ export interface Conversation {
   messages: Message[];
   createdAt: number;
   updatedAt: number;
+  unread?: number;
+  lastReadAt?: number;
+  crisis?: boolean;
 }
 
 // Wire protocol mirrored from nura-emotional-core/src/server/index.ts
